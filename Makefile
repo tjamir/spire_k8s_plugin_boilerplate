@@ -10,7 +10,9 @@ test:
 	go test -v -cover ./agent
 	go test -v -cover ./server
 
-#images:
+images:
+	docker build -f docker/agent.Dockerfile -t spire-agent-psat-iid .
+	docker build -f docker/server.Dockerfile -t spire-server-psat-iid .
 
 lint:
 	go lint ./...
