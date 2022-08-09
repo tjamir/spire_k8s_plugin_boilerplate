@@ -1,4 +1,4 @@
-package nodeattestor
+package main
 
 import (
 	"context"
