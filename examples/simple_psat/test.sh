@@ -13,6 +13,11 @@ fail() {
 	exit 1
 }
 
+load-images() {
+    kind load --name demo-cluster docker-image spire-server-psat-iid
+    kind load --name demo-cluster docker-image spire-agent-psat-iid
+}
+
 delete-ns() {
 	echo "${bold}Cleaning up...${norm}"
     kubectl delete --ignore-not-found namespace spire > /dev/null
@@ -36,6 +41,7 @@ cleanup() {
 # trap cleanup EXIT
 
 echo "${bold}Preparing environment...${norm}"
+load-images
 delete-ns
 kubectl create namespace spire
 
