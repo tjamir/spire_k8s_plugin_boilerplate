@@ -29,7 +29,7 @@ var (
 // Config defines the configuration for the plugin.
 // TODO: Add relevant configurables or remove if no configuration is required.
 type Config struct {
-	codeword string `hcl:"codeword"`
+	Codeword string `hcl:"codeword"`
 }
 
 // Plugin implements the NodeAttestor plugin
@@ -73,12 +73,8 @@ func (p *Plugin) AidAttestation(stream nodeattestorv1.NodeAttestor_AidAttestatio
 		return err
 	}
 
-	// TODO: Implement the RPC behavior. The following line silences compiler
-	// warnings and can be removed once the configuration is referenced by the
-	// implementation.
-	config = config
-
-	codeword := config.codeword
+	p.logger.Info("Attestation requested", "codeword", config.Codeword)
+	codeword := config.Codeword
 
 	return stream.Send(&nodeattestorv1.PayloadOrChallengeResponse{
 		Data: &nodeattestorv1.PayloadOrChallengeResponse_Payload{
@@ -99,6 +95,7 @@ func (p *Plugin) Configure(ctx context.Context, req *configv1.ConfigureRequest) 
 
 	// TODO: Validate configuration before setting/replacing existing
 	// configuration
+	p.logger.Info("Configure", "config", config)
 
 	p.setConfig(config)
 	return &configv1.ConfigureResponse{}, nil
