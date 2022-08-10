@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"sync"
 
 	"github.com/hashicorp/go-hclog"
@@ -10,8 +12,14 @@ import (
 	"github.com/spiffe/spire-plugin-sdk/pluginsdk"
 	nodeattestorv1 "github.com/spiffe/spire-plugin-sdk/proto/spire/plugin/server/nodeattestor/v1"
 	configv1 "github.com/spiffe/spire-plugin-sdk/proto/spire/service/common/config/v1"
+	"github.com/spiffe/spire/pkg/common/plugin/k8s"
+	"github.com/spiffe/spire/pkg/common/plugin/k8s/apiserver"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+)
+
+const (
+	pluginName = "k8s_psat_ext"
 )
 
 var (
@@ -29,6 +37,9 @@ var (
 // Config defines the configuration for the plugin.
 // TODO: Add relevant configurables or remove if no configuration is required.
 type Config struct {
+	trustDomain string   `hcl:"trust_domain"`
+	clusters    []string `hcl:"cluster"`
+	tokenPath   string   `hcl:"token_path"`
 }
 
 // Plugin implements the NodeAttestor plugin
@@ -88,12 +99,97 @@ func (p *Plugin) Attest(stream nodeattestorv1.NodeAttestor_AttestServer) error {
 	// implementation.
 	config = config
 
+	attestationData := new(k8s.PSATAttestationData)
+	if err := json.Unmarshal(payload, attestationData); err != nil {
+		return status.Errorf(codes.InvalidArgument, "failed to unmarshal data payload: %v", err)
+	}
+
+	if attestationData.Cluster == "" {
+		return status.Error(codes.InvalidArgument, "missing cluster in attestation data")
+	}
+
+	if attestationData.Token == "" {
+		return status.Error(codes.InvalidArgument, "missing token in attestation data")
+	}
+
+	cluster := config.clusters[attestationData.Cluster]
+	if cluster == nil {
+		return status.Errorf(codes.InvalidArgument, "not configured for cluster %q", attestationData.Cluster)
+	}
+
+	tokenStatus, err := cluster.client.ValidateToken(stream.Context(), attestationData.Token, cluster.audience)
+	if err != nil {
+		return status.Errorf(codes.Internal, "unable to validate token with TokenReview API: %v", err)
+	}
+
+	if !tokenStatus.Authenticated {
+		return status.Error(codes.PermissionDenied, "token not authenticated according to TokenReview API")
+	}
+
+	namespace, serviceAccountName, err := k8s.GetNamesFromTokenStatus(tokenStatus)
+	if err != nil {
+		return status.Errorf(codes.Internal, "fail to parse username from token review status: %v", err)
+	}
+	fullServiceAccountName := fmt.Sprintf("%v:%v", namespace, serviceAccountName)
+
+	if !cluster.serviceAccounts[fullServiceAccountName] {
+		return status.Errorf(codes.PermissionDenied, "%q is not an allowed service account", fullServiceAccountName)
+	}
+
+	podName, err := k8s.GetPodNameFromTokenStatus(tokenStatus)
+	if err != nil {
+		return status.Errorf(codes.Internal, "fail to get pod name from token review status: %v", err)
+	}
+
+	podUID, err := k8s.GetPodUIDFromTokenStatus(tokenStatus)
+	if err != nil {
+		return status.Errorf(codes.Internal, "fail to get pod UID from token review status: %v", err)
+	}
+
+	pod, err := cluster.client.GetPod(stream.Context(), namespace, podName)
+	if err != nil {
+		return status.Errorf(codes.Internal, "fail to get pod from k8s API server: %v", err)
+	}
+
+	node, err := cluster.client.GetNode(stream.Context(), pod.Spec.NodeName)
+	if err != nil {
+		return status.Errorf(codes.Internal, "fail to get node from k8s API server: %v", err)
+	}
+
+	nodeUID := string(node.UID)
+	if nodeUID == "" {
+		return status.Errorf(codes.Internal, "node UID is empty")
+	}
+
+	selectorValues := []string{
+		k8s.MakeSelectorValue("cluster", attestationData.Cluster),
+		k8s.MakeSelectorValue("agent_ns", namespace),
+		k8s.MakeSelectorValue("agent_sa", serviceAccountName),
+		k8s.MakeSelectorValue("agent_pod_name", podName),
+		k8s.MakeSelectorValue("agent_pod_uid", podUID),
+		k8s.MakeSelectorValue("agent_node_ip", pod.Status.HostIP),
+		k8s.MakeSelectorValue("agent_node_name", pod.Spec.NodeName),
+		k8s.MakeSelectorValue("agent_node_uid", nodeUID),
+	}
+
+	for key, value := range node.Labels {
+		if cluster.allowedNodeLabelKeys[key] {
+			selectorValues = append(selectorValues, k8s.MakeSelectorValue("agent_node_label", key, value))
+		}
+	}
+
+	for key, value := range pod.Labels {
+		if cluster.allowedPodLabelKeys[key] {
+			selectorValues = append(selectorValues, k8s.MakeSelectorValue("agent_pod_label", key, value))
+		}
+	}
+
 	return stream.Send(&nodeattestorv1.AttestResponse{
 		Response: &nodeattestorv1.AttestResponse_AgentAttributes{
 			AgentAttributes: &nodeattestorv1.AgentAttributes{
 				CanReattest:    true,
-				SpiffeId:       "spiffe://example.org/spire/agent/" + string(payload),
-				SelectorValues: []string{"message:" + string(payload)},
+				SpiffeId:       k8s.AgentID(pluginName, config.trustDomain, attestationData.Cluster, nodeUID),
+				SelectorValues: selectorValues,
 			},
 		},
 	})
@@ -111,6 +207,57 @@ func (p *Plugin) Configure(ctx context.Context, req *configv1.ConfigureRequest) 
 
 	// TODO: Validate configuration before setting/replacing existing
 	// configuration
+	if req.CoreConfiguration == nil {
+		return nil, status.Error(codes.InvalidArgument, "core configuration is required")
+	}
+	if req.CoreConfiguration.TrustDomain == "" {
+		return nil, status.Error(codes.InvalidArgument, "core configuration missing trust domain")
+	}
+
+	if len(config.clusters) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "configuration must have at least one cluster")
+	}
+
+	config := &attestorConfig{
+		trustDomain: req.CoreConfiguration.TrustDomain,
+		clusters:    make(map[string]*clusterConfig),
+	}
+
+	for name, cluster := range config.clusters {
+		if len(cluster.ServiceAccountAllowList) == 0 {
+			return nil, status.Errorf(codes.InvalidArgument, "cluster %q configuration must have at least one service account allowed", name)
+		}
+
+		serviceAccounts := make(map[string]bool)
+		for _, serviceAccount := range cluster.ServiceAccountAllowList {
+			serviceAccounts[serviceAccount] = true
+		}
+
+		var audience []string
+		if cluster.Audience == nil {
+			audience = defaultAudience
+		} else {
+			audience = *cluster.Audience
+		}
+
+		allowedNodeLabelKeys := make(map[string]bool)
+		for _, label := range cluster.AllowedNodeLabelKeys {
+			allowedNodeLabelKeys[label] = true
+		}
+
+		allowedPodLabelKeys := make(map[string]bool)
+		for _, label := range cluster.AllowedPodLabelKeys {
+			allowedPodLabelKeys[label] = true
+		}
+
+		config.clusters[name] = &clusterConfig{
+			serviceAccounts:      serviceAccounts,
+			audience:             audience,
+			client:               apiserver.New(cluster.KubeConfigFile),
+			allowedNodeLabelKeys: allowedNodeLabelKeys,
+			allowedPodLabelKeys:  allowedPodLabelKeys,
+		}
+	}
 
 	p.setConfig(config)
 	return &configv1.ConfigureResponse{}, nil
