@@ -32,14 +32,48 @@ var (
 	// pluginsdk.NeedsHostServices interface.
 	// TODO: Remove if the plugin does not need host services.
 	_ pluginsdk.NeedsHostServices = (*Plugin)(nil)
+
+	defaultAudience = []string{"spire-server"}
 )
 
 // Config defines the configuration for the plugin.
 // TODO: Add relevant configurables or remove if no configuration is required.
-type Config struct {
-	trustDomain string   `hcl:"trust_domain"`
-	clusters    []string `hcl:"cluster"`
-	tokenPath   string   `hcl:"token_path"`
+type AttestorConfig struct {
+	Clusters map[string]*ClusterConfig `hcl:"clusters"`
+}
+
+type ClusterConfig struct {
+	// Array of allowed service accounts names
+	// Attestation is denied if coming from a service account that is not in the list
+	ServiceAccountAllowList []string `hcl:"service_account_allow_list"`
+
+	// Audience for PSAT token validation
+	// If audience is not configured, defaultAudience will be used
+	// If audience value is set to an empty slice, k8s apiserver audience will be used
+	Audience *[]string `hcl:"audience"`
+
+	// Kubernetes configuration file path
+	// Used to create a k8s client to query the API server. If string is empty, in-cluster configuration is used
+	KubeConfigFile string `hcl:"kube_config_file"`
+
+	// Node labels that are allowed to use as selectors
+	AllowedNodeLabelKeys []string `hcl:"allowed_node_label_keys"`
+
+	// Pod labels that are allowed to use as selectors
+	AllowedPodLabelKeys []string `hcl:"allowed_pod_label_keys"`
+}
+
+type attestorConfig struct {
+	trustDomain string
+	clusters    map[string]*clusterConfig
+}
+
+type clusterConfig struct {
+	serviceAccounts      map[string]bool
+	audience             []string
+	client               apiserver.Client
+	allowedNodeLabelKeys map[string]bool
+	allowedPodLabelKeys  map[string]bool
 }
 
 // Plugin implements the NodeAttestor plugin
@@ -54,7 +88,7 @@ type Plugin struct {
 	// Configuration should be set atomically
 	// TODO: Remove if this plugin does not require configuration
 	configMtx sync.RWMutex
-	config    *Config
+	config    *attestorConfig
 
 	// The logger received from the framework via the SetLogger method
 	// TODO: Remove if this plugin does not need the logger.
@@ -97,7 +131,6 @@ func (p *Plugin) Attest(stream nodeattestorv1.NodeAttestor_AttestServer) error {
 	// TODO: Implement the RPC behavior. The following line silences compiler
 	// warnings and can be removed once the configuration is referenced by the
 	// implementation.
-	config = config
 
 	attestationData := new(k8s.PSATAttestationData)
 	if err := json.Unmarshal(payload, attestationData); err != nil {
@@ -200,8 +233,8 @@ func (p *Plugin) Attest(stream nodeattestorv1.NodeAttestor_AttestServer) error {
 // As such, it should replace the previous configuration atomically.
 // TODO: Remove if no configuration is required
 func (p *Plugin) Configure(ctx context.Context, req *configv1.ConfigureRequest) (*configv1.ConfigureResponse, error) {
-	config := new(Config)
-	if err := hcl.Decode(config, req.HclConfiguration); err != nil {
+	hclConfig := new(AttestorConfig)
+	if err := hcl.Decode(hclConfig, req.HclConfiguration); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "failed to decode configuration: %v", err)
 	}
 
@@ -214,16 +247,16 @@ func (p *Plugin) Configure(ctx context.Context, req *configv1.ConfigureRequest) 
 		return nil, status.Error(codes.InvalidArgument, "core configuration missing trust domain")
 	}
 
-	if len(config.clusters) == 0 {
+	if len(hclConfig.Clusters) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "configuration must have at least one cluster")
 	}
 
-	config := &attestorConfig{
+	attestorConfig := &attestorConfig{
 		trustDomain: req.CoreConfiguration.TrustDomain,
 		clusters:    make(map[string]*clusterConfig),
 	}
 
-	for name, cluster := range config.clusters {
+	for name, cluster := range hclConfig.Clusters {
 		if len(cluster.ServiceAccountAllowList) == 0 {
 			return nil, status.Errorf(codes.InvalidArgument, "cluster %q configuration must have at least one service account allowed", name)
 		}
@@ -250,7 +283,7 @@ func (p *Plugin) Configure(ctx context.Context, req *configv1.ConfigureRequest) 
 			allowedPodLabelKeys[label] = true
 		}
 
-		config.clusters[name] = &clusterConfig{
+		attestorConfig.clusters[name] = &clusterConfig{
 			serviceAccounts:      serviceAccounts,
 			audience:             audience,
 			client:               apiserver.New(cluster.KubeConfigFile),
@@ -259,13 +292,13 @@ func (p *Plugin) Configure(ctx context.Context, req *configv1.ConfigureRequest) 
 		}
 	}
 
-	p.setConfig(config)
+	p.setConfig(attestorConfig)
 	return &configv1.ConfigureResponse{}, nil
 }
 
 // setConfig replaces the configuration atomically under a write lock.
 // TODO: Remove if no configuration is required
-func (p *Plugin) setConfig(config *Config) {
+func (p *Plugin) setConfig(config *attestorConfig) {
 	p.configMtx.Lock()
 	p.config = config
 	p.configMtx.Unlock()
@@ -273,7 +306,7 @@ func (p *Plugin) setConfig(config *Config) {
 
 // getConfig gets the configuration under a read lock.
 // TODO: Remove if no configuration is required
-func (p *Plugin) getConfig() (*Config, error) {
+func (p *Plugin) getConfig() (*attestorConfig, error) {
 	p.configMtx.RLock()
 	defer p.configMtx.RUnlock()
 	if p.config == nil {
