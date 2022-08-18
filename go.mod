@@ -1,14 +1,15 @@
 module github.com/rodrigolc/psat-iid
 
-go 1.18
+go 1.17
 
 require (
 	github.com/hashicorp/go-hclog v1.2.2
 	github.com/hashicorp/hcl v1.0.1-0.20190430135223-99e2f22d1c94
-	github.com/spiffe/spire v1.4.0
 	github.com/spiffe/spire-plugin-sdk v1.3.3
 	google.golang.org/grpc v1.48.0
 )
+
+require github.com/spiffe/spire v1.4.0
 
 require (
 	github.com/PuerkitoBio/purell v1.1.1 // indirect
@@ -37,6 +38,8 @@ require (
 	github.com/modern-go/reflect2 v1.0.2 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/oklog/run v1.0.0 // indirect
+	github.com/onsi/ginkgo v1.16.5 // indirect
+	github.com/onsi/gomega v1.18.1 // indirect
 	github.com/spf13/pflag v1.0.5 // indirect
 	golang.org/x/crypto v0.0.0-20220525230936-793ad666bf5e // indirect
 	golang.org/x/net v0.0.0-20220624214902-1bab6f366d9e // indirect
@@ -48,6 +51,7 @@ require (
 	google.golang.org/appengine v1.6.7 // indirect
 	google.golang.org/genproto v0.0.0-20220706132729-d86698d07c53 // indirect
 	google.golang.org/protobuf v1.28.0 // indirect
+	gopkg.in/check.v1 v1.0.0-20201130134442-10cb98267c6c // indirect
 	gopkg.in/inf.v0 v0.9.1 // indirect
 	gopkg.in/square/go-jose.v2 v2.6.0 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
